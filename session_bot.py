@@ -1,4 +1,4 @@
-# session_bot.py
+# session_bot.py (CORRECTED)
 import os
 import asyncio
 import threading
@@ -15,7 +15,7 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 def health_check(): return "Session Generator Bot is alive!", 200
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000)) # Render uses port 10000
     flask_app.run(host="0.0.0.0", port=port)
 
 # --- Environment Variable Loading ---
@@ -29,7 +29,6 @@ if not BOT_TOKEN or not ADMIN_ID:
 # --- Bot and State Management ---
 app = Client("session_generator_bot", bot_token=BOT_TOKEN, in_memory=True)
 admin_filter = filters.user(ADMIN_ID)
-# This dictionary will hold the state of the login process for the admin
 login_state = {}
 
 # --- Command Handlers ---
@@ -59,7 +58,8 @@ async def generate_command(client, message: Message):
     await message.reply_text("**(Step 1/5)**\nPlease send your **API_ID**.\n\nGet it from my.telegram.org.")
 
 # --- Main Handler for Login Steps ---
-@app.on_message(filters.private & admin_filter & ~filters.command())
+# THIS IS THE CORRECTED LINE
+@app.on_message(filters.private & admin_filter & ~filters.command(["start", "cancel", "generate"]))
 async def handle_login_steps(client, message: Message):
     if ADMIN_ID not in login_state:
         return
@@ -108,7 +108,6 @@ async def handle_login_steps(client, message: Message):
             await temp_client.connect()
             await temp_client.sign_in(state_data["phone"], state_data["phone_code_hash"], user_input)
             
-            # If successful, export and send session string
             session_string = await temp_client.export_session_string()
             await message.reply_text(
                 "✅ **Login Successful!**\n\nHere is your session string. Copy it and save it securely.\n\n"
@@ -132,10 +131,8 @@ async def handle_login_steps(client, message: Message):
         temp_client = Client(":memory:", api_id=state_data["api_id"], api_hash=state_data["api_hash"])
         try:
             await temp_client.connect()
-            # We don't need to call sign_in again, just check the password
             await temp_client.check_password(user_input)
             
-            # If successful, export and send session string
             session_string = await temp_client.export_session_string()
             await message.reply_text(
                 "✅ **2FA Login Successful!**\n\nHere is your session string. Copy it and save it securely.\n\n"
@@ -151,6 +148,11 @@ async def handle_login_steps(client, message: Message):
 
 # --- Main Application Start ---
 if __name__ == "__main__":
+    # The API_ID and HASH for the control bot itself are not needed when using in_memory=True
+    # and not creating a session file on disk. But we add them for good practice.
+    app.api_id = 12345 # You can use dummy values here
+    app.api_hash = "dummy" 
+
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
