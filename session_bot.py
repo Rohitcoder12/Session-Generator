@@ -248,7 +248,7 @@ async def process_video_url(url, ydl_opts_override, original_message, status_mes
     video_path, thumbnail_path = None, None; user_id = original_message.from_user.id
     download_log_id = ObjectId()
     if downloads_collection is not None: downloads_collection.insert_one({"_id": download_log_id, "user_id": user_id, "url": url, "status": "processing", "start_time": datetime.now(timezone.utc)})
-    ydl_opts = {'format':'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best','outtmpl':os.path.join(DOWNLOAD_LOCATION,'%(title)s.%(ext)s'),'noplaylist':True,'quiet':True,'progress_hooks':[lambda d:progress_hook(d,status_message,message.from_user.id)],'max_filesize':450*1024*1024,}
+    ydl_opts = {'format':'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best','outtmpl':os.path.join(DOWNLOAD_LOCATION,'%(title)s.%(ext)s'),'noplaylist':True,'quiet':True,'progress_hooks':[lambda d:progress_hook(d,status_message,original_message.from_user.id)],'max_filesize':450*1024*1024,}
     ydl_opts.update(ydl_opts_override)
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -304,5 +304,4 @@ if __name__ == "__main__":
     load_sites_from_db()
     print("Starting web server thread...")
     threading.Thread(target=run_server, daemon=True).start()
-    print("Starting Pyrogram bot...")
-    app.run()
+    print("
