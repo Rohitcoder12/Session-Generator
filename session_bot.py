@@ -1,150 +1,315 @@
-# session_bot.py (FINAL - Corrected API ID Usage)
 import os
+import time
+import requests
 import asyncio
 import threading
-import logging
+import traceback
+import io
+import base64 # NEW: For encoding URLs in report buttons
+from itertools import zip_longest
+from yt_dlp import YoutubeDL
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import UserNotParticipant
+from pyrogram.enums import ChatMemberStatus
+
 from flask import Flask
-from pyrogram import Client, filters, errors
-from pyrogram.types import Message
+from pymongo import MongoClient
+from datetime import datetime, timezone
+from PIL import Image
+from bson.objectid import ObjectId
 
-# --- Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Configuration ---
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+DUMP_CHANNEL_ID = int(os.environ.get("DUMP_CHANNEL_ID", 0))
+DOWNLOAD_LOCATION = "./downloads/"
 
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def health_check(): return "Session Generator Bot is alive!", 200
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+# --- NEW: Owner & Report Configuration (SET THESE IN YOUR ENVIRONMENT) ---
+OWNER_ID = int(os.environ.get("OWNER_ID"))
+REPORT_CHANNEL_ID = int(os.environ.get("REPORT_CHANNEL_ID"))
+# --------------------------------------------------------------------
 
-# --- Environment Variable Loading ---
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_ID = int(os.environ.get('ADMIN_ID'))
-API_ID = int(os.environ.get('API_ID'))
-API_HASH = os.environ.get('API_HASH')
+# --- Start Message Configuration ---
+START_PHOTO_URL = "https://telegra.ph/Wow-07-03-5"
+MAINTAINED_BY_URL = "https://t.me/Rexonblood"
 
-if not all([BOT_TOKEN, ADMIN_ID, API_ID, API_HASH]):
-    logger.critical("FATAL: BOT_TOKEN, ADMIN_ID, API_ID, and API_HASH environment variables must all be set!")
-    exit()
+# --- Default Supported Sites (Used only if DB is empty) ---
+DEFAULT_SITES = [
+    "rock.porn", "hdsex.org", "beeg.com", "bravotube.net", "camwhores.tv", "camsoda.com", "chaturbate.com",
+    "desitube.com", "drporn.com", "dtube.video", "e-hentai.org", "empflix.com", "eporner.com", "erome.com",
+    "erome.io", "exhentai.org", "extremetube.com", "fapbox.com", "gaytube.com", "hclips.com", "hentai-foundry.com", 
+    "hentaivideos.net", "hentaistream.xxx", "hottystop.com", "iqtube.com", "ivxxx.com", "keezmovies.com", 
+    "livejasmin.com", "manyvids.com", "metacafe.com", "mofosex.net", "motherless.com", "mrdeepfakes.com", "myvidster.com", 
+    "noodlemagazine.com", "nuvid.com", "onlyfans.com", "perfectgirls.net", "pornhd.com", "pornhub.org", "pornhub.com", 
+    "pornteengirl.com", "porntube.com", "pornz.com", "redtube.net", "spankbang.com", "sunporno.com", "tnaflix.com", 
+    "tube8.es", "tubepleasure.com", "txxx.com", "txnhh.com", "vidmax.com", "vxxx.com", "pornoxo.com", "xanimu.com", 
+    "xhamster.com", "xhamster.desi", "xhamster43.desi", "xnxx.com", "xvideos.com", "xtube.com", "xvideos.es", 
+    "xvideos.fr", "xv1deos.com", "xhamster19.com", "youjizz.com", "youporn.com", "ytporn.com", "youtube.com", 
+    "instagram.com", "tiktok.com"
+]
 
-# --- Bot and State Management ---
-# THIS IS THE CORRECTED CLIENT INITIALIZATION
-app = Client(
-    "session_generator_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
-)
-admin_filter = filters.user(ADMIN_ID)
-login_state = {}
+# --- Force Subscription Configuration ---
+FORCE_SUB_CHANNEL = "@dailynewswalla"
 
-# --- Command Handlers ---
-@app.on_message(filters.command("start") & admin_filter)
-async def start_command(client, message: Message):
-    await message.reply_text(
-        "👋 **Pyrogram Session String Generator**\n\n"
-        "This bot will help you generate a session string for your user account.\n\n"
-        "➡️ Send /generate to begin.\n"
-        "➡️ Send /cancel at any time to stop."
-    )
+# --- State Management & DB Setup ---
+DOWNLOAD_IN_PROGRESS = False
+CANCELLATION_REQUESTS = set()
+SITES_LIST = [] # Will be loaded from DB on startup
 
-@app.on_message(filters.command("cancel") & admin_filter)
-async def cancel_command(client, message: Message):
-    if ADMIN_ID in login_state:
-        del login_state[ADMIN_ID]
-        await message.reply_text("✅ Process cancelled.")
-    else:
-        await message.reply_text("Nothing to cancel.")
+server = Flask(__name__)
+@server.route('/')
+def health_check(): return "Bot and Web Server are alive!", 200
+def run_server(): server.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
-@app.on_message(filters.command("generate") & admin_filter)
-async def generate_command(client, message: Message):
-    if ADMIN_ID in login_state:
-        await message.reply_text("A process is already running. Send /cancel first.")
-        return
-    # This bot will use its own API credentials for the temp client
-    login_state[ADMIN_ID] = {"state": "awaiting_phone", "api_id": API_ID, "api_hash": API_HASH}
-    await message.reply_text("**(Step 1/2)**\nPlease send your **phone number** in international format (e.g., +919876543210).")
+try:
+    db_client = MongoClient(MONGO_URI)
+    db = db_client.get_database("VideoBotDB")
+    users_collection = db.get_collection("users")
+    downloads_collection = db.get_collection("downloads_history")
+    sites_collection = db.get_collection("supported_sites") # NEW: Collection for sites
+    print("Successfully connected to MongoDB.")
+except Exception as e:
+    print(f"Error connecting to MongoDB: {e}"); exit()
 
-# --- Main Handler for Login Steps ---
-@app.on_message(filters.private & admin_filter & ~filters.command(["start", "cancel", "generate"]))
-async def handle_login_steps(client, message: Message):
-    if ADMIN_ID not in login_state:
-        return
-    
-    state_data = login_state[ADMIN_ID]
-    current_state = state_data.get("state")
-    user_input = message.text
+app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-    if current_state == "awaiting_phone":
-        state_data["phone"] = user_input
-        await message.reply_text("⏳ Please wait, trying to connect to Telegram...")
+# --- Helper Functions ---
+def create_progress_bar(percentage):
+    bar_length=10; filled_length=int(bar_length*percentage//100)
+    return '🟢'*filled_length+'⚪'*(bar_length-filled_length)
+
+def get_sites_list_text():
+    reply_text = "✅ **Here are the currently supported sites:**\n\n```\n"
+    # Uses the global SITES_LIST loaded from the DB
+    sorted_sites = sorted(list(set(SITES_LIST)))
+    if not sorted_sites: return "No sites are currently supported."
+    num_sites = len(sorted_sites)
+    sites_per_column = (num_sites + 2) // 3
+    columns = [sorted_sites[i:i + sites_per_column] for i in range(0, num_sites, sites_per_column)]
+    for row in zip_longest(*columns, fillvalue=""):
+        reply_text += f"{row[0]:<25}{row[1]:<25}{row[2]:<25}\n"
+    reply_text += "```"
+    return reply_text
+
+# ... (progress_hook and upload_progress_callback are unchanged) ...
+def progress_hook(d, m, user_id):
+    if user_id in CANCELLATION_REQUESTS: raise Exception("Download cancelled by user.")
+    if d['status']=='downloading' and (total_bytes := d.get('total_bytes') or d.get('total_bytes_estimate')):
+        p=(db:=d.get('downloaded_bytes'))/total_bytes*100
+        if(time.time()-globals().get('last_update_time',0))>2:
+            try:asyncio.create_task(m.edit_text(f"⏳ **Downloading...**\n{create_progress_bar(p)} {p:.2f}% [{db/(1024*1024):.1f}MB]", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]])));globals()['last_update_time']=time.time()
+            except:pass
+async def upload_progress_callback(c, t, m, user_id):
+    if user_id in CANCELLATION_REQUESTS: raise Exception("Upload cancelled by user.")
+    p=c/t*100
+    if(time.time()-globals().get('last_upload_update_time',0))>2:
+        try:await m.edit_text(f"⏫ **Uploading...**\n{create_progress_bar(p)} {p:.2f}% [{c/(1024*1024):.1f}MB / {t/(1024*1024):.1f}MB]", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]));globals()['last_upload_update_time']=time.time()
+        except:pass
+
+# --- Bot Commands ---
+@app.on_message(filters.command("start") & filters.private)
+async def start_command(client, message):
+    # This function is now perfect, no changes needed
+    user_id = message.from_user.id
+    try:
+        member = await client.get_chat_member(chat_id=FORCE_SUB_CHANNEL, user_id=user_id)
+        if member.status in [ChatMemberStatus.BANNED, ChatMemberStatus.RESTRICTED]:
+            await message.reply_text("You are banned from using this bot."); return
+    except UserNotParticipant:
+        join_button = InlineKeyboardMarkup([[InlineKeyboardButton("Join Our Channel", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]])
+        await message.reply_text("To use this bot, you must join our channel. After joining, please send /start again.", reply_markup=join_button); return
+    except Exception as e:
+        print(f"Error during force sub check: {e}"); await message.reply_text("An error occurred while checking your membership status. Please ensure the bot is an admin in the channel."); return
+    u = message.from_user
+    if users_collection is not None:
+        ud={"_id":u.id,"first_name":u.first_name,"last_name":u.last_name,"username":u.username,"last_started":datetime.now(timezone.utc)}
+        try:users_collection.update_one({"_id":u.id},{"$set":ud},upsert=True);print(f"User {u.id} saved.")
+        except Exception as e:print(f"DB Error: {e}")
+    start_text = ("» **I'M RX Downloader BOT**\n\n" + "📥 **I CAN DOWNLOAD VIDEOS FROM:**\n" + "• YOUTUBE, INSTAGRAM, TIKTOK\n" + "• PORNHUB, XVIDEOS, XNXX\n" + "• AND 1000+ OTHER SITES!\n\n" + "🚀 **JUST SEND ME A LINK!**")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("• SUPPORTED SITES", callback_data="show_sites_list"), InlineKeyboardButton("• MAINTAINED BY", url=MAINTAINED_BY_URL)]
+    ])
+    await message.reply_photo(photo=START_PHOTO_URL, caption=start_text, reply_markup=keyboard)
+
+@app.on_message(filters.command("sites") & filters.private)
+async def sites_command(client, message):
+    sites_text = get_sites_list_text()
+    await message.reply_text(sites_text)
+
+# --- NEW: Admin Commands for Site Management ---
+@app.on_message(filters.command("addsite") & filters.user(OWNER_ID))
+async def add_site_command(client, message):
+    try:
+        domain = message.text.split(" ", 1)[1].strip().lower()
+        if not domain:
+            await message.reply_text("Usage: `/addsite example.com`")
+            return
         
-        temp_client = Client(":memory:", api_id=state_data["api_id"], api_hash=state_data["api_hash"])
-        try:
-            await temp_client.connect()
-            sent_code = await temp_client.send_code(user_input)
-            state_data["phone_code_hash"] = sent_code.phone_code_hash
-            state_data["state"] = "awaiting_otp"
-            await message.reply_text("**(Step 2/2)**\nAn OTP has been sent to your Telegram account. Please send it here.")
-        except Exception as e:
-            await message.reply_text(f"❌ **Error:** {e}\n\nProcess cancelled. Please start again with /generate.")
-            del login_state[ADMIN_ID]
-        finally:
-            if temp_client.is_connected:
-                await temp_client.disconnect()
+        if sites_collection.find_one({"domain": domain}):
+            await message.reply_text(f"`{domain}` is already in the supported sites list.")
+            return
 
-    elif current_state == "awaiting_otp":
-        state_data["otp"] = user_input
-        await message.reply_text("⏳ Verifying OTP...")
+        sites_collection.insert_one({"domain": domain})
+        SITES_LIST.append(domain) # Update in-memory list
+        await message.reply_text(f"✅ Successfully added `{domain}` to the supported sites list.")
+    except IndexError:
+        await message.reply_text("Usage: `/addsite example.com`")
+    except Exception as e:
+        await message.reply_text(f"An error occurred: {e}")
 
-        temp_client = Client(":memory:", api_id=state_data["api_id"], api_hash=state_data["api_hash"])
-        try:
-            await temp_client.connect()
-            await temp_client.sign_in(state_data["phone"], state_data["phone_code_hash"], user_input)
-            
-            session_string = await temp_client.export_session_string()
-            await message.reply_text(
-                "✅ **Login Successful!**\n\nHere is your session string. Copy it and save it securely.\n\n"
-                f"<code>{session_string}</code>"
-            )
-            del login_state[ADMIN_ID]
+@app.on_message(filters.command("delsite") & filters.user(OWNER_ID))
+async def del_site_command(client, message):
+    try:
+        domain = message.text.split(" ", 1)[1].strip().lower()
+        if not domain:
+            await message.reply_text("Usage: `/delsite example.com`")
+            return
 
-        except errors.SessionPasswordNeeded:
-            state_data["state"] = "awaiting_password"
-            await message.reply_text("Your account has 2FA enabled. Please send your 2FA password.")
-        except Exception as e:
-            await message.reply_text(f"❌ **Error:** {e}\n\nProcess cancelled. Please start again with /generate.")
-            del login_state[ADMIN_ID]
-        finally:
-            if temp_client.is_connected:
-                await temp_client.disconnect()
+        result = sites_collection.delete_one({"domain": domain})
+        if result.deleted_count > 0:
+            if domain in SITES_LIST: SITES_LIST.remove(domain) # Update in-memory list
+            await message.reply_text(f"✅ Successfully removed `{domain}` from the supported sites list.")
+        else:
+            await message.reply_text(f"`{domain}` was not found in the list.")
+    except IndexError:
+        await message.reply_text("Usage: `/delsite example.com`")
+    except Exception as e:
+        await message.reply_text(f"An error occurred: {e}")
 
-    elif current_state == "awaiting_password":
-        await message.reply_text("⏳ Verifying 2FA password...")
-        temp_client = Client(":memory:", api_id=state_data["api_id"], api_hash=state_data["api_hash"])
-        try:
-            await temp_client.connect()
-            await temp_client.check_password(user_input)
-            
-            session_string = await temp_client.export_session_string()
-            await message.reply_text(
-                "✅ **2FA Login Successful!**\n\nHere is your session string. Copy it and save it securely.\n\n"
-                f"<code>{session_string}</code>"
-            )
-            del login_state[ADMIN_ID]
-        except Exception as e:
-            await message.reply_text(f"❌ **Error:** {e}\n\nProcess cancelled. Please start again with /generate.")
-            del login_state[ADMIN_ID]
-        finally:
-            if temp_client.is_connected:
-                await temp_client.disconnect()
+# --- Callback Handlers ---
+@app.on_callback_query(filters.regex("^show_sites_list$"))
+async def show_sites_handler(client, callback_query):
+    sites_text = get_sites_list_text()
+    await callback_query.answer()
+    await callback_query.message.reply_text(sites_text)
 
-# --- Main Application Start ---
-if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    logger.info("Starting Session Generator Bot...")
-    app.run()
+# NEW: Handler for the "Report Link" button
+@app.on_callback_query(filters.regex("^report_"))
+async def report_link_handler(client, callback_query):
+    try:
+        encoded_url = callback_query.data.split("_", 1)[1]
+        decoded_url = base64.urlsafe_b64decode(encoded_url).decode('utf-8')
+        user = callback_query.from_user
+        
+        report_text = (
+            f"🚨 **Link Report**\n\n"
+            f"**User:** {user.mention} (`{user.id}`)\n"
+            f"**Reported URL:** `{decoded_url}`"
+        )
+        
+        await client.send_message(chat_id=REPORT_CHANNEL_ID, text=report_text)
+        await callback_query.answer("✅ Thank you! The link has been reported to the admin.", show_alert=True)
+        # Edit the original message to remove the button
+        await callback_query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        print(f"Error handling report: {e}")
+        await callback_query.answer("Could not send report. Please contact the admin.", show_alert=True)
+
+@app.on_callback_query(filters.regex("^cancel_"))
+async def cancel_handler(client, callback_query):
+    # This function is now perfect, no changes needed
+    user_id = int(callback_query.data.split("_")[1]);
+    if callback_query.from_user.id != user_id: await callback_query.answer("This is not for you!", show_alert=True); return
+    CANCELLATION_REQUESTS.add(user_id); await callback_query.answer("Cancellation request sent.", show_alert=False); await callback_query.message.edit_text("🤚 **Cancellation requested...** Please wait.")
+
+# --- Link Handler & Processing Logic ---
+@app.on_message(filters.private & filters.regex(r"https?://[^\s]+"))
+async def link_handler(client, message):
+    # This now uses the global SITES_LIST, perfect.
+    user_id = message.from_user.id
+    try:
+        member = await client.get_chat_member(chat_id=FORCE_SUB_CHANNEL, user_id=user_id)
+        if member.status in [ChatMemberStatus.BANNED, ChatMemberStatus.RESTRICTED]: await message.reply_text("You are banned from using this bot."); return
+    except UserNotParticipant:
+        join_button = InlineKeyboardMarkup([[InlineKeyboardButton("Join Our Channel", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]])
+        await message.reply_text("To use this bot, you must join our channel. After joining, please send the link again.", reply_markup=join_button); return
+    except Exception as e: print(f"Error during force sub check: {e}"); await message.reply_text("An error occurred while checking your membership status. Please ensure the bot is an admin in the channel."); return
+    global DOWNLOAD_IN_PROGRESS
+    if DOWNLOAD_IN_PROGRESS: await message.reply_text("🤚 **Bot is busy!** Please try again in a few minutes."); return
+    url = message.text.strip()
+    # MODIFIED: Check against the global SITES_LIST
+    if not any(site in url for site in SITES_LIST): await message.reply_text("❌ **Sorry, this website is not supported.**\n\nUse /sites to see the full list."); return
+    DOWNLOAD_IN_PROGRESS = True; CANCELLATION_REQUESTS.discard(user_id)
+    status_message = await message.reply_text("✅ **URL received. Starting process...**", quote=True, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]))
+    try:
+        if "erome.com" in url or "erome.io" in url: await handle_erome_album(url, message, status_message)
+        else: await handle_single_video(url, message, status_message)
+    except Exception as e: print(f"--- UNHANDLED ERROR IN LINK_HANDLER ---\n{traceback.format_exc()}\n--------------------"); await status_message.edit_text(f"❌ A critical error occurred: {e}")
+    finally: CANCELLATION_REQUESTS.discard(user_id); DOWNLOAD_IN_PROGRESS = False
+
+async def handle_single_video(url, message, status_message):
+    ydl_opts = {'format':'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best','outtmpl':os.path.join(DOWNLOAD_LOCATION,'%(title)s.%(ext)s'),'noplaylist':True,'quiet':True,'progress_hooks':[lambda d:progress_hook(d,status_message,message.from_user.id)],'max_filesize':450*1024*1024}
+    await process_video_url(url, ydl_opts, message, status_message)
+
+async def handle_erome_album(url, message, status_message):
+    album_limit = 10; user_id = message.from_user.id;
+    await status_message.edit_text("🔎 This looks like an Erome album...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]))
+    meta_opts = {'extract_flat': True, 'quiet': True, 'playlistend': album_limit}
+    with YoutubeDL(meta_opts) as ydl: info = ydl.extract_info(url, download=False)
+    original_entries, content_to_process, seen_filenames = info.get('entries', []), [], set()
+    for entry in original_entries:
+        filename = entry.get('url', '').split('/')[-1]
+        if filename and filename not in seen_filenames: content_to_process.append(entry); seen_filenames.add(filename)
+    if not content_to_process: await status_message.edit_text("❌ No content found in this Erome album."); return
+    content_count = len(content_to_process)
+    await status_message.edit_text(f"✅ Album found with **{content_count}** unique items (limit {album_limit}). Processing...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]))
+    await asyncio.sleep(2)
+    for i, entry in enumerate(content_to_process, 1):
+        if user_id in CANCELLATION_REQUESTS: await status_message.edit_text("✅ **Album processing cancelled.**"); break
+        entry_url = entry['url']
+        if any(entry_url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']): await handle_photo_download(entry, f"[{i}/{content_count}] ", message)
+        else:
+            single_video_ydl_opts = {'format':'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best','outtmpl':os.path.join(DOWNLOAD_LOCATION,f"album_item_{i}_%(title)s.%(ext)s"),'quiet':True,'progress_hooks':[lambda d:progress_hook(d,status_message,user_id)],'max_filesize':450*1024*1024}
+            await status_message.edit_text(f"Downloading video **{i}/{content_count}**...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]))
+            await process_video_url(entry_url, single_video_ydl_opts, message, status_message, is_album_item=True)
+    if not user_id in CANCELLATION_REQUESTS: await status_message.edit_text(f"✅ Finished processing all {content_count} items!", reply_markup=None); await asyncio.sleep(5)
+    await status_message.delete()
+async def handle_photo_download(entry, prefix, message):
+    photo_url, photo_title = entry.get('url'), prefix + entry.get('title', 'Untitled Photo')
+    await message.reply_photo(photo=photo_url, caption=photo_title); await asyncio.sleep(1)
+
+# --- MODIFIED: process_video_url to include the Report button on failure ---
+async def process_video_url(url, ydl_opts, original_message, status_message, is_album_item=False):
+    video_path, thumbnail_path = None, None; user_id = original_message.from_user.id
+    download_log_id = ObjectId()
+    if downloads_collection is not None: downloads_collection.insert_one({"_id": download_log_id, "user_id": user_id, "url": url, "status": "processing", "start_time": datetime.now(timezone.utc)})
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False); video_title = info.get('title', 'Untitled Video')
+            if downloads_collection is not None: downloads_collection.update_one({"_id": download_log_id}, {"$set": {"video_title": video_title}})
+            print(f"[{user_id}] Starting download for: {video_title}"); ydl.download([url])
+            list_of_files = [os.path.join(DOWNLOAD_LOCATION, f) for f in os.listdir(DOWNLOAD_LOCATION)]
+            if not list_of_files: raise FileNotFoundError("Download folder is empty.")
+            video_path = max(list_of_files, key=os.path.getctime)
+            file_size_mb = round(os.path.getsize(video_path) / (1024 * 1024), 2)
+        if thumbnail_url := info.get('thumbnail'):
+            try:
+                r=requests.get(thumbnail_url); r.raise_for_status()
+                with Image.open(io.BytesIO(r.content)) as img: thumbnail_path = os.path.join(DOWNLOAD_LOCATION, "thumb.jpg"); img.convert("RGB").save(thumbnail_path, "jpeg")
+            except Exception as e: print(f"Thumb Error: {e}"); thumbnail_path = None
+        await status_message.edit_text("⬆️ **Uploading to Telegram...**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}")]]))
+        sent_message = await app.send_video(chat_id=user_id, video=video_path, caption=f"**Title:** {video_title}\n**Source:** {info.get('webpage_url', url)}", thumb=thumbnail_path, supports_streaming=True, progress=upload_progress_callback, progress_args=(status_message, user_id))
+        if downloads_collection is not None: downloads_collection.update_one({"_id": download_log_id}, {"$set": {"status": "success", "end_time": datetime.now(timezone.utc), "file_size_mb": file_size_mb}})
+        if not is_album_item: await status_message.edit_text("✅ **Upload complete!**", reply_markup=None)
+        if sent_message and DUMP_CHANNEL_ID != 0: await sent_message.forward(DUMP_CHANNEL_ID)
+    except Exception as e:
+        error_message = f"❌ An error occurred: {type(e).__name__}"
+        report_markup = None
+        if "cancelled by user" in str(e):
+            error_message = "✅ **Operation cancelled."
+        else:
+            if "is larger than" in str(e): error_message = "❌ **Error:** Video is too large."
+            # Create the report button
+            encoded_url = base64.urlsafe_b64encode(url.encode()).decode()
+            report_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🚨 Report Link", callback_data=f"report_{encoded_url}")]])
+        
+        if downloads_collection is not None: downloads_collection.update_one({"_id": download_log_id}, {"$set": {"status": "failed", "error_message": str(e)}})
+        print(f"--- PROCESS_VIDEO_URL ERROR ---\n{traceback.format_exc()}\n--------------------")
+        if not is_album_item:
+            await status_message.edit_text(error_message, reply_markup=report_markup)
+    finally:
+        if video_path and os.path.exists(video_path): os.remove(video_path)
+        if
